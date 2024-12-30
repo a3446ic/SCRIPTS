@@ -1,0 +1,12 @@
+- HAY OPERACIONES ESPECIALES EN CARTERA
+    SELECT * FROM EXT.CARTERA WHERE P_ESPECIAL_RENOVACION IS NOT NULL;
+
+- NO HAY OPERACIONES ESPECIALES EN CARTERA. BUSCAR EL PLAN DE COMISIONAMIENTO DEL MEDIADOR
+    - USAR QUERY PROCEDIMIENTO GENPET_REGULARIZAR_SIOC
+        ----------------------------------------------------------------------------------------------------
+	    -- Se Busca el registro de CARTERA asociado con los porcentajes del plan del producto 
+	    -- y por defecto del producto
+		-- ----------------------------------------------------------------------------------------------------
+
+- RESULTADO ANTERIOR NULL
+    - % POR DEFECTO DEL PRODUCTO
