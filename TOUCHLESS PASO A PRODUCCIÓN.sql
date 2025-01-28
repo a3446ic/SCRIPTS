@@ -1,7 +1,7 @@
 /********************** PASO A PRODUCCIÓN TOUCHLESS *************/
 
 -- RUTA INSTALACIÓN TOUCHLESS
-C:\Users\a3446\TouchlessDeployment\TD_Client\bin
+cd C:\Users\a3446\TouchlessDeployment\TD_Client\bin
 
 
 1. PROBAR CONEXIÓN
