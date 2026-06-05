@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE EXT.sp_traspaso_mediador_mediador_con_derechos_caucion_json (IN p_json NVARCHAR(5000))
+CREATE OR REPLACE PROCEDURE EXT.sp_traspaso_mediador_mediador_con_derechos_caucion (IN caseId BIGINT, IN nombreCasoOrigen VARCHAR(100))
 LANGUAGE SQLSCRIPT 
 AS
 /*
@@ -10,6 +10,10 @@ AS
 	| Procedure Purpose: TRASPASO DE CARTERA DE UN MEDIADOR A OTRO MEDIADOR CON DERECHOS Y OBLIGACIONES CAUCIÓN
 	| 
 	| Version: 1	
+	| Version: 2 SMM 20260209 Cambio traspasos expedientes y avales	
+	| Version: 3 SMM 20260318 FECHA_EFECTO y FECHA_VENCIMIENTO NULL en EXPEDIENTES	
+	| Version: 4 SMM 20260406	Traspasos con ACTIVO = 1 o ACTIVO =2
+	| Version: 5 SMM 20260605	Traspaso de expedientes, los avales se obtienen de la tabla CARTERA
 	|
 	| 
 	|
@@ -27,72 +31,22 @@ BEGIN
     DECLARE v_modifSource NVARCHAR(250);
     DECLARE v_tipoTraspaso NVARCHAR(10);
     DECLARE v_tipoTraspasoCaucion NVARCHAR(100);
-	DECLARE cTipoMovimiento NVARCHAR(50);
+	DECLARE v_TipoMovimiento INT;
+	DECLARE v_DescTipoMovimiento NVARCHAR(50);
+	DECLARE v_ModifUser NVARCHAR(50);
+	DECLARE v_NumPoliza BIGINT;
+	DECLARE v_codMediadorReceptor NVARCHAR(100);
+    DECLARE v_subClaveMediadorReceptor NVARCHAR(100);
+
     -- CONSTANTES
-    DECLARE cReport CONSTANT VARCHAR(50) := 'sp_traspaso_mediador_mediador_con_derechos_caucion';
-    DECLARE cVersion  CONSTANT VARCHAR(3) :='01';
+    DECLARE cReport CONSTANT VARCHAR(75) := 'sp_traspaso_mediador_mediador_con_derechos_caucion';
+    DECLARE cVersion  CONSTANT VARCHAR(3) :='5';
     DECLARE cEsquema CONSTANT VARCHAR(3) := 'EXT';
     DECLARE cRamo CONSTANT VARCHAR(10) := 'CAUCION';
     DECLARE cDerechosObligaciones NVARCHAR(50) := 'CON DERECHOS Y OBLIGACIONES';
     
-	-- DECLARACION DE CURSOR    
-    DECLARE CURSOR CURSOR_RECEPTOR FOR
-    SELECT 
-        C.IDCASE,
-        C.CODIGOMEDIADORCEDENTE,
-        C.SUBCLAVEMEDIADORCEDENTE,
-        C.FECHATRASPASO,
-        P.NUM_POLIZA_CEDENTE,
-        P.PORCENTAJE_INTERMEDIACION_CEDENTE,
-        R.CODIGOMEDIADORRECEPTOR,
-        R.SUBCLAVEMEDIADORRECEPTOR,
-        --PR.NUM_POLIZA_RECEPTOR,
-        R.PORCENTAJE_INTERMEDIACION_TRASPASO,
-        PR.NUM_AVAL_RECEPTOR,
-        PR.PORCENTAJE_INTERMEDIACION_RECEPTOR
-        
-    FROM 
-        JSON_TABLE(:p_json, '$' 
-            COLUMNS (
-                idCase BIGINT PATH '$.caseId',
-                codigoMediadorCedente NVARCHAR(10) PATH '$.codigoMediadorCedente',
-                subClaveMediadorCedente NVARCHAR(10) PATH '$.subClaveMediadorCedente',
-                fechaTraspaso DATE PATH '$.fechaTraspaso',
-                tipoTraspaso NVARCHAR(10) PATH '$.tipoTraspaso'
-            )
-        ) AS C
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.polizas[*]' 
-            COLUMNS (
-                num_poliza_cedente NVARCHAR(20) PATH '$.num_poliza',
-                num_aval_cedente NVARCHAR(20) PATH '$.num_aval',
-                porcentaje_intermediacion_cedente NVARCHAR(10) PATH '$.porcentaje_intermediacion'
-            )
-        ) AS P 
-        ON 1=1
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.receptor[*]' 
-            COLUMNS (
-                codigoMediadorReceptor NVARCHAR(10) PATH '$.codigoMediadorReceptor',
-                subClaveMediadorReceptor NVARCHAR(10) PATH '$.subClaveMediadorReceptor',
-                porcentaje_intermediacion_traspaso NVARCHAR(10) PATH '$.porcentajeTraspaso',
-                receptorIndex FOR ORDINALITY  -- Índice del receptor
-            )
-        ) AS R 
-        ON 1=1
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.receptor[*].polizasReceptor[*]' 
-            COLUMNS (
-                receptorIndex FOR ORDINALITY,  -- Índice del receptor al que pertenece esta póliza
-                num_poliza_receptor NVARCHAR(20) PATH '$.num_poliza',
-                num_aval_receptor NVARCHAR(20) PATH '$.num_aval',
-                porcentaje_intermediacion_receptor NVARCHAR(10) PATH '$.porcentaje_intermediacion'
-                
-            )
-        ) AS PR 
-        ON R.receptorIndex = PR.receptorIndex  
-        -- AND P.NUM_POLIZA_CEDENTE = PR.NUM_POLIZA_RECEPTOR
-    ;
+
+
 
  ------------------------------- HANDLER EXCEPTION -------------------------
 	DECLARE EXIT HANDLER FOR SQLEXCEPTION
@@ -107,256 +61,141 @@ BEGIN
     --Inicio
 	CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'INICIO PROCEDIMIENTO v' || cVersion || ' with SESSION_USER '|| SESSION_USER, CReport, io_contador);
 	
-	CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'JSON: ' || :p_json , CReport, io_contador);
 
-    SELECT JSON_VALUE(:p_json, '$.caseId') INTO v_caseId FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.tipoTraspaso') INTO v_tipoTraspaso FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.fechaTraspaso') INTO v_fechaTraspaso FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.tipoMovimiento') INTO cTipoMovimiento FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.tipoTraspasoCaucion') INTO v_tipoTraspasoCaucion FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.codigoMediadorCedente') INTO v_codMediadorCedente FROM DUMMY;
-    SELECT JSON_VALUE(:p_json, '$.subClaveMediadorCedente') INTO v_subClaveMediadorCedente FROM DUMMY;
-    
-	-- COMPROBAR SI EXISTE LA TABLA TEMPORAL
-    IF (SELECT COUNT(*) FROM SYS.TABLES WHERE SCHEMA_NAME = 'EXT' AND TABLE_NAME = 'TRASPASOS_TEMP') = 0 THEN
+	
+	
+	--OBTENER VALORES
+	SELECT DISTINCT 
+		CASE WHEN TIPO_TRASPASO = 'N' THEN 'TOTAL' ELSE 'PARCIAL' END
+		, COD_MEDIADOR_CEDENTE
+		, SUBCLAVE_CEDENTE
+		, FECHA_EFECTO_SOLICITUD
+		, TIPO_MOVIMIENTO
+		, 'MANUAL - CASEID: ' || :caseId
+		, NUM_POLIZA
+		, COD_MEDIADOR_RECEPTOR
+		, SUBCLAVE_RECEPTOR
+		INTO v_tipoTraspaso,v_codMediadorCedente,v_subClaveMediadorCedente,v_fechaTraspaso,v_TipoMovimiento, v_ModifUser, v_NumPoliza,v_codMediadorReceptor,v_subClaveMediadorReceptor
+	FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL;
    
-        CREATE COLUMN TABLE EXT.TRASPASOS_TEMP(
-            IDCASE BIGINT,
-            TIPO_MOVIMIENTO NVARCHAR(250),
-            TIPO_TRASPASO NVARCHAR(50),
-            RAMO NVARCHAR(10),
-            TIPO_TRASPASO_CAUCION NVARCHAR(50),
-            DERECHOS_OBLIGACIONES NVARCHAR(50),
-            CODIGOMEDIADORCEDENTE NVARCHAR(4),
-            SUBCLAVEMEDIADORCEDENTE NVARCHAR(4),
-            FECHATRASPASO DATE,
-            NUM_POLIZA_CEDENTE NVARCHAR(40),
-            NUM_AVAL_CEDENTE NVARCHAR(10),
-            PORCENTAJE_INTERMEDIACION_CEDENTE BIGINT,
-            CODIGOMEDIADORRECEPTOR NVARCHAR(4),
-            SUBCLAVEMEDIADORRECEPTOR NVARCHAR(4),
-            NUM_POLIZA_RECEPTOR NVARCHAR(40),
-            NUM_AVAL_RECEPTOR NVARCHAR(20),
-            PORCENTAJE_INTERMEDIACION_RECEPTOR  BIGINT,
-            MODIF_USER NVARCHAR(20),
-            MODIF_DATE DATETIME
-        ) UNLOAD PRIORITY 5 AUTO MERGE;
+	-- TIPO MOVIMIENTO
+    SELECT CASE 
+    	WHEN v_TipoMovimiento = 1 THEN 'SIN MEDIADOR > MEDIADOR'
+    	WHEN v_TipoMovimiento = 2 THEN 'MEDIADOR > MEDIADOR'
+    	WHEN v_TipoMovimiento = 3 THEN 'TRASPASO %'
+    	WHEN v_TipoMovimiento = 4 THEN 'ERROR CAPTURA'
+    	WHEN v_TipoMovimiento = 5 THEN 'MEDIADOR > CANAL DIRECTO'
+        WHEN v_TipoMovimiento = 6 THEN 'OPERACIONES ESPECIALES'
+        WHEN v_TipoMovimiento = 8 THEN 'ENTRE SUBCLAVES'
+    	END
+    INTO v_DescTipoMovimiento
+    FROM DUMMY;
 
-        CALL EXT.LIB_GLOBAL_CESCE :w_debug (
-            i_Tenant,
-            'CREADA TABLA ' || cEsquema || '.' || 'TRASPASOS_TEMP',
-            'cReport',
-            io_contador
-        ); 
+    -- COMPROBAR SI ES TRASPASO TOTAL 'N' O PARCIAL	'P'
+    IF ((SELECT COUNT(*) FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseID AND RAMO = cRamo) = (SELECT COUNT(*) FROM EXT.CARTERA WHERE COD_MEDIADOR = :v_codMediadorCedente AND COD_SUBCLAVE = v_subClaveMediadorCedente AND RAMO = cRAMO AND FECHA_VENCIMIENTO >= v_fechaTraspaso AND ACTIVO > 0)) THEN
+    	v_tipoTraspaso:= 'TOTAL';
     ELSE
-    	-- ELIMINAR REGISTROS PREVIOS DE LA TABLA TEMPORAL
-    	DELETE FROM EXT.TRASPASOS_TEMP WHERE IDCASE = v_caseId;
+    	v_tipoTraspaso:= 'PARCIAL';
     END IF;
-
-    -- INSERTAR DATOS EN LA TABLA TEMPORAL DESDE EL JSON    
-
-    INSERT INTO EXT.TRASPASOS_TEMP(IDCASE,TIPO_MOVIMIENTO,TIPO_TRASPASO,RAMO,TIPO_TRASPASO_CAUCION,DERECHOS_OBLIGACIONES,
-    	CODIGOMEDIADORCEDENTE,SUBCLAVEMEDIADORCEDENTE,FECHATRASPASO,NUM_POLIZA_CEDENTE,NUM_AVAL_CEDENTE,PORCENTAJE_INTERMEDIACION_CEDENTE,
-    	CODIGOMEDIADORRECEPTOR,SUBCLAVEMEDIADORRECEPTOR,NUM_POLIZA_RECEPTOR,NUM_AVAL_RECEPTOR,PORCENTAJE_INTERMEDIACION_RECEPTOR,
-    	MODIF_USER,MODIF_DATE
-    	
-    )
-    SELECT 
-        C.IDCASE,
-        UPPER(cTipoMovimiento),
-        UPPER(v_tipoTraspaso),
-        cRamo,
-        UPPER(v_tipoTraspasoCaucion),
-        cDerechosObligaciones,
-        C.CODIGOMEDIADORCEDENTE,
-        C.SUBCLAVEMEDIADORCEDENTE,
-        C.FECHATRASPASO,
-        P.NUM_POLIZA_CEDENTE,
-        P.NUM_AVAL_CEDENTE,
-        P.PORCENTAJE_INTERMEDIACION_CEDENTE,
-        R.CODIGOMEDIADORRECEPTOR,
-        R.SUBCLAVEMEDIADORRECEPTOR,
-    	PR.NUM_POLIZA_RECEPTOR,
-    	PR.NUM_AVAL_RECEPTOR,
-        PR.PORCENTAJE_INTERMEDIACION_RECEPTOR,
-        SESSION_USER,
-        CURRENT_TIMESTAMP
-    FROM 
-        JSON_TABLE(:p_json, '$' 
-            COLUMNS (
-                idCase BIGINT PATH '$.caseId',
-                codigoMediadorCedente NVARCHAR(10) PATH '$.codigoMediadorCedente',
-                subClaveMediadorCedente NVARCHAR(10) PATH '$.subClaveMediadorCedente',
-                fechaTraspaso DATE PATH '$.fechaTraspaso'
-            )
-        ) AS C
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.polizas[*]' 
-            COLUMNS (
-                num_poliza_cedente NVARCHAR(20) PATH '$.num_poliza',
-                num_aval_cedente NVARCHAR(20) PATH '$.num_aval',
-                porcentaje_intermediacion_cedente NVARCHAR(10) PATH '$.porcentaje_intermediacion'
-            )
-        ) AS P 
-        ON 1=1
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.receptor[*]' 
-            COLUMNS (
-                codigoMediadorReceptor NVARCHAR(10) PATH '$.codigoMediadorReceptor',
-                subClaveMediadorReceptor NVARCHAR(10) PATH '$.subClaveMediadorReceptor',
-                porcentaje_intermediacion_traspaso NVARCHAR(10) PATH '$.porcentajeTraspaso',
-                receptorIndex FOR ORDINALITY  -- Índice del receptor
-            )
-        ) AS R 
-        ON 1=1
-    LEFT JOIN 
-        JSON_TABLE(:p_json, '$.receptor[*].polizasReceptor[*]' 
-            COLUMNS (
-                receptorIndex FOR ORDINALITY,  -- Índice del receptor al que pertenece esta póliza
-                num_poliza_receptor NVARCHAR(20) PATH '$.num_poliza',
-                num_aval_receptor NVARCHAR(20) PATH '$.num_aval',
-            	porcentaje_intermediacion_receptor NVARCHAR(10) PATH '$.porcentaje_intermediacion'
-            )
-        ) AS PR 
-        ON R.receptorIndex = PR.receptorIndex  
-        -- AND P.NUM_POLIZA_CEDENTE = PR.NUM_POLIZA_RECEPTOR
-    ;
-
-	CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'INSERTADOS ' || ::ROWCOUNT || ' REGISTROS. TABLA TRASPASOS_TEMP', cReport, io_contador);
-    
-    IF v_tipoTraspaso = 'total' THEN
-		v_modifSource:= 'TRASPASO TOTAL CAUCIÓN ' || v_caseId;
+	
+	IF EXISTS(SELECT 1 FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseId AND COD_AVAL IS NULL AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL)	THEN	
+		v_tipoTraspasoCaucion := 'expediente';
 	ELSE
-		v_modifSource:= 'TRASPASO PARCIAL CAUCIÓN' || v_caseId;
+		v_tipoTraspasoCaucion := 'aval';
 	END IF;
 	
 	
 	
 	IF v_tipoTraspasoCaucion = 'expediente' THEN
 		
-		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'TRASPASO EXPEDIENTE MEDIADOR > MEDIADOR ' || UPPER(:v_tipoTraspaso) || ' MEDIADOR CEDENTE: '|| :v_codMediadorCedente ||'-'||:v_subClaveMediadorCedente , CReport, io_contador);
-		v_modifSource:= v_modifSource || 'EXPEDIENTE MEDIADOR MEDIADOR CON DERECHOS Y OBLIGACIONES ' || v_caseId;
-		
-		-- ABRIR CURSOR
-	    OPEN CURSOR_RECEPTOR;
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'CASE ID: ' ||:caseID|| ' - TRASPASO EXPEDIENTE ' ||v_tipoTraspaso|| ' ' ||:v_DescTipoMovimiento || ' '  || :cDerechosObligaciones  || ' MEDIADOR CEDENTE: '|| :v_codMediadorCedente ||'-'||:v_subClaveMediadorCedente , CReport, io_contador);
 	
-	    FOR CR AS CURSOR_RECEPTOR
-		DO
-		
-		SELECT CR.CODIGOMEDIADORRECEPTOR FROM DUMMY;
-		
-		INSERT INTO EXT.CARTERA 
-	    SELECT 
-		"RAMO",
-		"IDPRODUCT",
-		"NUM_POLIZA",
-		"IDMODALIDAD",
-		"IDSUBMODALIDAD",
-		"NUM_FIANZA",
-		"NUM_EXPEDIENTE",
-		"NUM_AVAL_HOST",
-		"NUM_ANUALIDAD",
-		"FECHA_EMISION",
-		"FECHA_EFECTO",
-		"FECHA_VENCIMIENTO",
-		"IDPAIS",
-		"PRIMA_PROVISIONAL_INT",
-		"PRIMA_PROVISIONAL_EXT",
-		"IDDIVISA_INT",
-		"IDDIVISA_EXT",
-		"IDDIVISA_COBERTURA",
-		"PRIMA_MIN_INT",
-		"PRIMA_MIN_EXT",
-		CR.CODIGOMEDIADORRECEPTOR, --COD_MEDIADOR
-		CR.SUBCLAVEMEDIADORRECEPTOR, --COD_SUBCLAVE
-		COALESCE(CR.PORCENTAJE_INTERMEDIACION_RECEPTOR,COALESCE(CR.PORCENTAJE_INTERMEDIACION_TRASPASO,P_INTERMEDIACION)),
-        (CASE WHEN NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
-		'2200-01-01', --FECHA_FIN
-		"P_ESPECIAL_EMISION",
-		"P_ESPECIAL_RENOVACION",
-		"NIF_TOMADOR",
-		"NOMBRE_TOMADOR",
-		"FECHA_EFECTO_TRASPASO",
-		"MEDIADOR_PRINCIPAL_CIC",
-		"ACTIVO",
-		CURRENT_TIMESTAMP, --CREATION_DATE
-		CURRENT_TIMESTAMP, --MODIF_DATE
-		'SMM', --CREATION_USER
-		v_modifSource, --MODIF_SOURCE
-		NULL, --FECHA_INICIO_OPESP
-		NULL -- FECHA_FIN_OPESP
-		FROM EXT.CARTERA
-	    WHERE COD_MEDIADOR = :v_codMediadorCedente
-	    AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	    AND RAMO = cRamo
-	    AND ACTIVO = 1
-	    AND NUM_POLIZA = CR.NUM_POLIZA_CEDENTE
-	  --  AND (
-			-- -- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	  --  	EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS) 
-	  --  			AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM #TEMPNUMPOLIZAS)
-	  --  	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	  --  	OR NOT EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS)
-	  --  )
-	    ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
-
-		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'INSERTADOS ' || ::ROWCOUNT || ' REGISTROS. PÓLIZA ' || CR.NUM_POLIZA_CEDENTE || ' - MEDIADOR RECEPTOR ' || CR.CODIGOMEDIADORRECEPTOR||'-'||CR.SUBCLAVEMEDIADORRECEPTOR, cReport, io_contador);
-	    
-		END FOR;
-		CLOSE CURSOR_RECEPTOR;
-
-
-	    --ACTUALIZAMOS MEDIADOR CEDENTE
-	    UPDATE EXT.CARTERA
-	    SET ACTIVO = 0,	   
-	    FECHA_FIN = (CASE WHEN NUM_FIANZA IS NULL THEN ADD_DAYS(v_fechaTraspaso,-1) ELSE FECHA_FIN END),
-	    MODIF_USER = 'SMM',
-	    MODIF_SOURCE = v_modifSource,
-	    MODIF_DATE = CURRENT_TIMESTAMP
-	    WHERE COD_MEDIADOR = :v_codMediadorCedente
-	    AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	    AND RAMO = cRamo
-	    AND ACTIVO = 1
-	    AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM JSON_TABLE(:p_json, '$.polizas[*]' 
-            COLUMNS (
-                num_poliza_cedente NVARCHAR(20) PATH '$.num_poliza',
-                porcentaje_emision_cedente NVARCHAR(10) PATH '$.porcentaje_emision'
-            )
-        ))
-	    ;
-	    -- AND (
-	    -- 	-- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	    -- 	EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS) 
-	    -- 			AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM #TEMPNUMPOLIZAS)
-	    -- 	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	    -- 	OR NOT EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS)
-	    -- );
-		
-		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'ACTUALIZADOS ' || ::ROWCOUNT || ' REGISTROS. MEDIADOR CEDENTE ' || :v_codMediadorCedente||'-'||:v_subClaveMediadorCedente, cReport, io_contador);
+		v_modifSource:= 'EXPEDIENTE MEDIADOR MEDIADOR '|| :cDerechosObligaciones || ' ' || :caseId;
 		
 		
-		
-	ELSE
-		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'TRASPASO ' || UPPER(:v_tipoTraspaso) || ' CAUCIÓN AVAL MEDIADOR > MEDIADOR. CEDENTE: '|| :v_codMediadorCedente ||'-'||:v_subClaveMediadorCedente , CReport, io_contador);
-		
-		v_modifSource:= v_modifSource || 'AVAL MEDIADOR MEDIADOR CON DERECHOS Y OBLIGACIONES ' || v_caseId;
-		-- ABRIR CURSOR
-	    OPEN CURSOR_RECEPTOR;
-	
-	    FOR CR AS CURSOR_RECEPTOR
-		DO
-			-- SELECT CR.CODIGOMEDIADORRECEPTOR,CR.NUM_AVAL_RECEPTOR FROM DUMMY;
+		--TRASPASO EXPEDIENTES
+		TEMP_EXPEDIENTES = SELECT DISTINCT NUM_POLIZA,COD_MEDIADOR_RECEPTOR,SUBCLAVE_RECEPTOR,INTERMEDIACION_RECEPTOR,FECHA_EFECTO_SOLICITUD,COD_MEDIADOR_CEDENTE,SUBCLAVE_CEDENTE,COD_AVAL
+			FROM EXT.SOLICITUD_TRASPASO 
+			WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL AND COD_AVAL IS NULL
+			ORDER BY NUM_POLIZA,COD_AVAL;
 			
-			INSERT INTO EXT.CARTERA 
-		    SELECT 
+	
+		INSERT INTO EXT.CARTERA
+			SELECT 
 			"RAMO",
 			"IDPRODUCT",
-			"NUM_POLIZA",
+			C."NUM_POLIZA",
 			"IDMODALIDAD",
 			"IDSUBMODALIDAD",
 			"NUM_FIANZA",
 			"NUM_EXPEDIENTE",
 			"NUM_AVAL_HOST",
+			"NUM_ANUALIDAD",
+			NULL,--"FECHA_EMISION"
+			NULL,-- "FECHA_EFECTO"
+			NULL,--"FECHA_VENCIMIENTO"
+			"IDPAIS",
+			"PRIMA_PROVISIONAL_INT",
+			"PRIMA_PROVISIONAL_EXT",
+			"IDDIVISA_INT",
+			"IDDIVISA_EXT",
+			"IDDIVISA_COBERTURA",
+			"PRIMA_MIN_INT",
+			"PRIMA_MIN_EXT",
+			T.COD_MEDIADOR_RECEPTOR,
+			T.SUBCLAVE_RECEPTOR,
+			T.INTERMEDIACION_RECEPTOR,
+			(CASE WHEN NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
+			'2200-01-01', --FECHA_FIN
+			"P_ESPECIAL_EMISION",
+			"P_ESPECIAL_RENOVACION",
+			"NIF_TOMADOR",
+			"NOMBRE_TOMADOR",
+			v_fechaTraspaso,--C."FECHA_EFECTO_TRASPASO",
+			"MEDIADOR_PRINCIPAL_CIC",
+			"ACTIVO",
+			CURRENT_TIMESTAMP, --CREATION_DATE
+			CURRENT_TIMESTAMP, --MODIF_DATE
+			v_ModifUser, --CREATION_USER
+			nombreCasoOrigen, --MODIF_SOURCE
+			NULL, --FECHA_INICIO_OPESP
+			NULL -- FECHA_FIN_OPESP
+			FROM EXT.CARTERA C INNER JOIN :TEMP_EXPEDIENTES T ON C.NUM_POLIZA = T.NUM_POLIZA AND C.COD_MEDIADOR = T.COD_MEDIADOR_CEDENTE AND C.COD_SUBCLAVE = T.SUBCLAVE_CEDENTE
+				AND COALESCE(C.NUM_AVAL_HOST,-1) = COALESCE(T.COD_AVAL,-1)
+			WHERE COD_MEDIADOR = :v_codMediadorCedente
+			AND COD_SUBCLAVE = :v_subClaveMediadorCedente
+			AND RAMO = cRamo
+			AND ACTIVO = 1
+			-- AND C.NUM_POLIZA = CT.NUM_POLIZA
+			
+			ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
+		
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'EXPEDIENTES INSERTADOS ' || ::ROWCOUNT || ' REGISTROS.', cReport, io_contador);
+		
+		--v5 SMM
+		--TRASPASO AVALES
+		-- TEMP_AVAL = SELECT DISTINCT NUM_POLIZA,COD_MEDIADOR_RECEPTOR,SUBCLAVE_RECEPTOR,INTERMEDIACION_RECEPTOR,FECHA_EFECTO_SOLICITUD,COD_MEDIADOR_CEDENTE,SUBCLAVE_CEDENTE,COD_AVAL
+		-- 	FROM EXT.SOLICITUD_TRASPASO 
+		-- 	WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL AND COD_AVAL IS NOT NULL
+		-- 	ORDER BY NUM_POLIZA,COD_AVAL;
+		TEMP_AVAL_EXP = SELECT NUM_POLIZA,COD_MEDIADOR,COD_SUBCLAVE,P_INTERMEDIACION,NUM_AVAL_HOST
+			FROM EXT.CARTERA  
+			WHERE NUM_POLIZA = v_NumPoliza AND NUM_AVAL_HOST IS NOT NULL AND COD_MEDIADOR || '-' || COD_SUBCLAVE <> v_codMediadorReceptor  ||'-' || v_subClaveMediadorReceptor 
+				AND RAMO = cRamo AND ACTIVO > 0--CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL AND COD_AVAL IS NOT NULL
+			-- ORDER BY NUM_POLIZA,COD_AVAL
+			;
+		
+		
+		INSERT INTO EXT.CARTERA
+			SELECT 
+			"RAMO",
+			"IDPRODUCT",
+			C."NUM_POLIZA",
+			"IDMODALIDAD",
+			"IDSUBMODALIDAD",
+			"NUM_FIANZA",
+			"NUM_EXPEDIENTE",
+			T."NUM_AVAL_HOST",
 			"NUM_ANUALIDAD",
 			"FECHA_EMISION",
 			"FECHA_EFECTO",
@@ -369,266 +208,151 @@ BEGIN
 			"IDDIVISA_COBERTURA",
 			"PRIMA_MIN_INT",
 			"PRIMA_MIN_EXT",
-			CR.CODIGOMEDIADORRECEPTOR, --COD_MEDIADOR
-			CR.SUBCLAVEMEDIADORRECEPTOR, --COD_SUBCLAVE
-			COALESCE(CR.PORCENTAJE_INTERMEDIACION_RECEPTOR,COALESCE(CR.PORCENTAJE_INTERMEDIACION_TRASPASO,P_INTERMEDIACION)),
-	        (CASE WHEN NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
+			:v_codMediadorReceptor,
+			:v_subClaveMediadorReceptor,
+			T.P_INTERMEDIACION,
+			(CASE WHEN NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
 			'2200-01-01', --FECHA_FIN
 			"P_ESPECIAL_EMISION",
 			"P_ESPECIAL_RENOVACION",
 			"NIF_TOMADOR",
 			"NOMBRE_TOMADOR",
-			"FECHA_EFECTO_TRASPASO",
+			v_fechaTraspaso,--C."FECHA_EFECTO_TRASPASO",
 			"MEDIADOR_PRINCIPAL_CIC",
 			"ACTIVO",
 			CURRENT_TIMESTAMP, --CREATION_DATE
 			CURRENT_TIMESTAMP, --MODIF_DATE
-			'SMM', --CREATION_USER
-			v_modifSource, --MODIF_SOURCE
+			v_ModifUser, --CREATION_USER
+			nombreCasoOrigen, --MODIF_SOURCE
 			NULL, --FECHA_INICIO_OPESP
 			NULL -- FECHA_FIN_OPESP
-			FROM EXT.CARTERA
-		    WHERE COD_MEDIADOR = :v_codMediadorCedente
-		    AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-		    AND RAMO = cRamo
-		    AND ACTIVO = 1
-		    AND NUM_AVAL_HOST = CR.NUM_AVAL_RECEPTOR
-		  --  AND (
-				-- -- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-		  --  	EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS) 
-		  --  			AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM #TEMPNUMPOLIZAS)
-		  --  	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-		  --  	OR NOT EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS)
-		  --  )
-		    ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
-		    
-		    CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'INSERTADOS ' || ::ROWCOUNT || ' REGISTROS. PÓLIZA ' || CR.NUM_POLIZA_CEDENTE || ' - MEDIADOR RECEPTOR ' || CR.CODIGOMEDIADORRECEPTOR||'-'||CR.SUBCLAVEMEDIADORRECEPTOR, cReport, io_contador);
-		END FOR;
-		CLOSE CURSOR_RECEPTOR;
+			FROM EXT.CARTERA C INNER JOIN :TEMP_AVAL_EXP T ON C.NUM_POLIZA = T.NUM_POLIZA AND C.COD_MEDIADOR = T.COD_MEDIADOR AND C.COD_SUBCLAVE = T.COD_SUBCLAVE
+				AND COALESCE(C.NUM_AVAL_HOST,-1) = COALESCE(T.NUM_AVAL_HOST,-1)
+			-- WHERE C.COD_MEDIADOR = :v_codMediadorCedente
+			-- AND C.COD_SUBCLAVE = :v_subClaveMediadorCedente
+			-- AND RAMO = cRamo
+			-- AND ACTIVO > 0
+			-- AND C.NUM_POLIZA = CT.NUM_POLIZA
+			
+			ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
+		
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'AVALES INSERTADOS ' || ::ROWCOUNT || ' REGISTROS.', cReport, io_contador);
+		
+	 
+	    --ACTUALIZAMOS MEDIADOR CEDENTE-EXPEDIENTES
+	    UPDATE EXT.CARTERA
+	    SET ACTIVO = 0,	   
+	    FECHA_FIN = (CASE WHEN NUM_FIANZA IS NULL THEN ADD_DAYS(v_fechaTraspaso,-1) ELSE FECHA_FIN END),
+	    FECHA_EFECTO_TRASPASO = v_fechaTraspaso,
+	    MODIF_USER = v_ModifUser,
+	    MODIF_SOURCE = nombreCasoOrigen,
+	    MODIF_DATE = CURRENT_TIMESTAMP
+	    WHERE COD_MEDIADOR ||'-'||COD_SUBCLAVE <> :v_codMediadorReceptor ||'-'|| :v_subClaveMediadorReceptor
+	    AND RAMO = cRamo
+	    AND ACTIVO > 0
+	    AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL)
+	    ;
+		
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'ACTUALIZADOS ACTIVO = 0 => ' || ::ROWCOUNT || ' REGISTROS. EXPEDIENTE MEDIADOR CEDENTE ' || :v_codMediadorCedente||'-'||:v_subClaveMediadorCedente, cReport, io_contador);
+		
+		
+		
+	ELSE
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'CASE ID: ' ||:caseID|| ' - TRASPASO AVAL ' ||v_tipoTraspaso|| ' ' ||:v_DescTipoMovimiento || ' '  || :cDerechosObligaciones  || ' MEDIADOR CEDENTE: '|| :v_codMediadorCedente ||'-'||:v_subClaveMediadorCedente , CReport, io_contador);
+		
+		v_modifSource:= 'AVAL MEDIADOR MEDIADOR '|| cDerechosObligaciones ||' ' || :caseId;
+		
+		TEMP_AVAL = SELECT DISTINCT NUM_POLIZA,COD_MEDIADOR_RECEPTOR,SUBCLAVE_RECEPTOR,INTERMEDIACION_RECEPTOR,FECHA_EFECTO_SOLICITUD,COD_MEDIADOR_CEDENTE,SUBCLAVE_CEDENTE,COD_AVAL
+			FROM EXT.SOLICITUD_TRASPASO 
+			WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL AND COD_AVAL IS NOT NULL
+			ORDER BY NUM_POLIZA,COD_AVAL;
+			
+
+		INSERT INTO EXT.CARTERA
+			SELECT 
+			C."RAMO",
+			C."IDPRODUCT",
+			C."NUM_POLIZA",
+			C."IDMODALIDAD",
+			C."IDSUBMODALIDAD",
+			C."NUM_FIANZA",
+			C."NUM_EXPEDIENTE",
+			C."NUM_AVAL_HOST",
+			C."NUM_ANUALIDAD",
+			C."FECHA_EMISION",
+			C."FECHA_EFECTO",
+			C."FECHA_VENCIMIENTO",
+			C."IDPAIS",
+			C."PRIMA_PROVISIONAL_INT",
+			C."PRIMA_PROVISIONAL_EXT",
+			C."IDDIVISA_INT",
+			C."IDDIVISA_EXT",
+			C."IDDIVISA_COBERTURA",
+			C."PRIMA_MIN_INT",
+			C."PRIMA_MIN_EXT",
+			T.COD_MEDIADOR_RECEPTOR,
+			T.SUBCLAVE_RECEPTOR,
+			T.INTERMEDIACION_RECEPTOR,
+			(CASE WHEN C.NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
+			'2200-01-01', --FECHA_FIN
+			"P_ESPECIAL_EMISION",
+			"P_ESPECIAL_RENOVACION",
+			"NIF_TOMADOR",
+			"NOMBRE_TOMADOR",
+			v_fechaTraspaso,--C."FECHA_EFECTO_TRASPASO",
+			"MEDIADOR_PRINCIPAL_CIC",
+			"ACTIVO",
+			CURRENT_TIMESTAMP, --CREATION_DATE
+			CURRENT_TIMESTAMP, --MODIF_DATE
+			v_ModifUser, --CREATION_USER
+			nombreCasoOrigen, --MODIF_SOURCE
+			NULL, --FECHA_INICIO_OPESP
+			NULL -- FECHA_FIN_OPESP
+			FROM EXT.CARTERA C INNER JOIN :TEMP_AVAL T ON C.NUM_POLIZA = T.NUM_POLIZA AND C.COD_MEDIADOR = T.COD_MEDIADOR_CEDENTE AND C.COD_SUBCLAVE = T.SUBCLAVE_CEDENTE
+				AND COALESCE(C.NUM_AVAL_HOST,-1) = COALESCE(T.COD_AVAL,-1)
+			WHERE COD_MEDIADOR = :v_codMediadorCedente
+			AND COD_SUBCLAVE = :v_subClaveMediadorCedente
+			AND RAMO = cRamo
+			AND ACTIVO > 0
+			
+			ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
+		
+		CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'AVALES INSERTADOS ' || ::ROWCOUNT || ' REGISTROS.', cReport, io_contador);
+		
+	 
 		
 		--ACTUALIZAMOS MEDIADOR CEDENTE
 	    UPDATE EXT.CARTERA
-	    SET ACTIVO = 0,	   
-	    MODIF_USER = 'SMM',
-	    MODIF_SOURCE = v_modifSource,
+	    SET ACTIVO = 0,	
+	    FECHA_EFECTO_TRASPASO = v_fechaTraspaso,
+	    MODIF_USER = v_ModifUser,
+	    MODIF_SOURCE = nombreCasoOrigen,
 	    MODIF_DATE = CURRENT_TIMESTAMP
 	    WHERE COD_MEDIADOR = :v_codMediadorCedente
 	    AND COD_SUBCLAVE = :v_subClaveMediadorCedente
 	    AND RAMO = cRamo
-	    AND ACTIVO = 1
-	    AND NUM_AVAL_HOST IN (SELECT NUM_AVAL_CEDENTE FROM JSON_TABLE(:p_json, '$.polizas[*]' 
-            COLUMNS (
-                num_poliza_cedente NVARCHAR(20) PATH '$.num_poliza',
-                porcentaje_emision_cedente NVARCHAR(10) PATH '$.porcentaje_emision',
-                num_aval_cedente NVARCHAR(20) PATH '$.num_aval'
-            )
-        ))
+	    AND ACTIVO > 0
+	    AND NUM_AVAL_HOST IN (SELECT COD_AVAL FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL)
+	    AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM EXT.SOLICITUD_TRASPASO WHERE CASEID = :caseId AND RAMO = cRamo AND NUM_POLIZA IS NOT NULL)
 	    ;
-	    CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'ACTUALIZADOS ' || ::ROWCOUNT || ' REGISTROS. MEDIADOR CEDENTE ' || :v_codMediadorCedente||'-'||:v_subClaveMediadorCedente, cReport, io_contador);
+	    CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'ACTUALIZADOS ACTIVO = 0 => ' || ::ROWCOUNT || ' REGISTROS. MEDIADOR CEDENTE ' || :v_codMediadorCedente||'-'||:v_subClaveMediadorCedente, cReport, io_contador);
 	
 	END IF;
 	
 	CALL EXT.LIB_GLOBAL_CESCE:w_debug (i_Tenant, 'FIN PROCEDIMIENTO  with SESSION_USER '|| SESSION_USER, cReport, io_contador);
 
-	-- ----!!!!! PRUEBAS TEST BORRAR !!!!! --------
- --   TRUNCATE TABLE EXT.CARTERA;
- --	INSERT INTO EXT.CARTERA SELECT * FROM EXT.CARTERA_BKP_04022025 ;
- --	----!!!!! PRUEBAS TEST BORRAR !!!!! --------
-
- --   --TABLA TEMPORAL PARA NUM_POLIZAS
- --   CREATE LOCAL TEMPORARY TABLE #TEMPNUMPOLIZAS (NUM_POLIZA NVARCHAR(50));
- --   INSERT INTO #TEMPNUMPOLIZAS SELECT NUM_POLIZA FROM JSON_TABLE(:p_json, '$.numPolizas[*]' COLUMNS (NUM_POLIZA NVARCHAR(2500) PATH '$'));
 	
-	-- --TABLA TEMPORAL PARA COD_AVAL
- --   CREATE LOCAL TEMPORARY TABLE #TEMPCODAVAL (COD_AVAL NVARCHAR(50));
- --   INSERT INTO #TEMPCODAVAL SELECT COD_AVAL FROM JSON_TABLE(:p_json, '$.codAval[*]' COLUMNS (COD_AVAL NVARCHAR(2500) PATH '$'));
-    
-   
- --   -- COMPROBAR SI ES TRASPASO TOTAL O PARCIAL
-	-- IF NOT EXISTS(SELECT 1 FROM #TEMPNUMPOLIZAS) THEN
-	-- 	v_modifSource:= 'TRASPASO CAUCIÓN ';
-	-- ELSE
-	-- 	v_modifSource:= 'TRASPASO CAUCIÓN ';
-	-- END IF;
-
-	-- IF v_tipoTraspasoCaucion = 'expediente' THEN
-	-- 	v_modifSource:= v_modifSource || 'EXPEDIENTE TOTAL MEDIADOR MEDIADOR CON DERECHOS Y OBLIGACIONES ' || v_caseId;
-	--     -- INSERTAMOS EXPEDIENTE MEDIADOR RECEPTOR
-	--     INSERT INTO EXT.CARTERA 
-	--     SELECT 
-	-- 	"RAMO",
-	-- 	"IDPRODUCT",
-	-- 	"NUM_POLIZA",
-	-- 	"IDMODALIDAD",
-	-- 	"IDSUBMODALIDAD",
-	-- 	"NUM_FIANZA",
-	-- 	"NUM_EXPEDIENTE",
-	-- 	"NUM_AVAL_HOST",
-	-- 	"NUM_ANUALIDAD",
-	-- 	"FECHA_EMISION",
-	-- 	"FECHA_EFECTO",
-	-- 	"FECHA_VENCIMIENTO",
-	-- 	"IDPAIS",
-	-- 	"PRIMA_PROVISIONAL_INT",
-	-- 	"PRIMA_PROVISIONAL_EXT",
-	-- 	"IDDIVISA_INT",
-	-- 	"IDDIVISA_EXT",
-	-- 	"IDDIVISA_COBERTURA",
-	-- 	"PRIMA_MIN_INT",
-	-- 	"PRIMA_MIN_EXT",
-	-- 	:v_codMediadorReceptor, --COD_MEDIADOR
-	-- 	v_subClaveMediadorReceptor, --COD_SUBCLAVE
-	-- 	"P_INTERMEDIACION",
- --       (CASE WHEN NUM_FIANZA IS NULL THEN v_fechaTraspaso ELSE FECHA_INICIO END), --FECHA_INICIO
-	-- 	'2200-01-01', --FECHA_FIN
-	-- 	"P_ESPECIAL_EMISION",
-	-- 	"P_ESPECIAL_RENOVACION",
-	-- 	"NIF_TOMADOR",
-	-- 	"NOMBRE_TOMADOR",
-	-- 	"FECHA_EFECTO_TRASPASO",
-	-- 	"MEDIADOR_PRINCIPAL_CIC",
-	-- 	"ACTIVO",
-	-- 	CURRENT_TIMESTAMP, --CREATION_DATE
-	-- 	CURRENT_TIMESTAMP, --MODIF_DATE
-	-- 	'SMM', --CREATION_USER
-	-- 	v_modifSource, --MODIF_SOURCE
-	-- 	NULL, --FECHA_INICIO_OPESP
-	-- 	NULL -- FECHA_FIN_OPESP
-	-- 	FROM EXT.CARTERA
-	--     WHERE COD_MEDIADOR = :v_codMediadorCedente
-	--     AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	--     AND RAMO = cRamo
-	--     AND ACTIVO = 1
-	--     AND (
-	-- 		-- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	--     	EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS) 
-	--     			AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM #TEMPNUMPOLIZAS)
-	--     	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	--     	OR NOT EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS)
-	--     )
-	--     ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
-	    
-	--  --   --ACTUALIZAMOS MEDIADOR CEDENTE
-	--     UPDATE EXT.CARTERA
-	--     SET ACTIVO = 0,	   
-	--     FECHA_FIN = (CASE WHEN NUM_FIANZA IS NULL THEN ADD_DAYS(v_fechaTraspaso,-1) ELSE FECHA_FIN END),
-	--     MODIF_USER = 'SMM',
-	--     MODIF_SOURCE = v_modifSource,
-	--     MODIF_DATE = CURRENT_TIMESTAMP
-	--     WHERE COD_MEDIADOR = :v_codMediadorCedente
-	--     AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	--     AND RAMO = cRamo
-	--     AND ACTIVO = 1
-	--     AND (
-	--     	-- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	--     	EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS) 
-	--     			AND NUM_POLIZA IN (SELECT NUM_POLIZA FROM #TEMPNUMPOLIZAS)
-	--     	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	--     	OR NOT EXISTS (SELECT 1 FROM #TEMPNUMPOLIZAS)
-	--     );
-	-- ELSE --TIPO: AVAL_INDIVIDUAL
-	-- 	v_modifSource:= v_modifSource || 'AVAL INDIVIDUAL TOTAL MEDIADOR MEDIADOR CON DERECHOS Y OBLIGACIONES ' || v_caseId;
-		
-	-- 	-- INSERTAMOS AVAL MEDIADOR RECEPTOR
-	--     INSERT INTO EXT.CARTERA 
-	--     SELECT 
-	-- 	"RAMO",
-	-- 	"IDPRODUCT",
-	-- 	"NUM_POLIZA",
-	-- 	"IDMODALIDAD",
-	-- 	"IDSUBMODALIDAD",
-	-- 	"NUM_FIANZA",
-	-- 	"NUM_EXPEDIENTE",
-	-- 	"NUM_AVAL_HOST",
-	-- 	"NUM_ANUALIDAD",
-	-- 	"FECHA_EMISION",
-	-- 	"FECHA_EFECTO",
-	-- 	"FECHA_VENCIMIENTO",
-	-- 	"IDPAIS",
-	-- 	"PRIMA_PROVISIONAL_INT",
-	-- 	"PRIMA_PROVISIONAL_EXT",
-	-- 	"IDDIVISA_INT",
-	-- 	"IDDIVISA_EXT",
-	-- 	"IDDIVISA_COBERTURA",
-	-- 	"PRIMA_MIN_INT",
-	-- 	"PRIMA_MIN_EXT",
-	-- 	:v_codMediadorReceptor, --COD_MEDIADOR
-	-- 	v_subClaveMediadorReceptor, --COD_SUBCLAVE
-	-- 	"P_INTERMEDIACION",
-	-- 	"FECHA_INICIO",
-	-- 	"FECHA_FIN",
-	-- 	"P_ESPECIAL_EMISION",
-	-- 	"P_ESPECIAL_RENOVACION",
-	-- 	"NIF_TOMADOR",
-	-- 	"NOMBRE_TOMADOR",
-	-- 	"FECHA_EFECTO_TRASPASO",
-	-- 	"MEDIADOR_PRINCIPAL_CIC",
-	-- 	"ACTIVO",
-	-- 	CURRENT_TIMESTAMP, --CREATION_DATE
-	-- 	CURRENT_TIMESTAMP, --MODIF_DATE
-	-- 	'SMM', --CREATION_USER
-	-- 	v_modifSource, --MODIF_SOURCE
-	-- 	NULL, --FECHA_INICIO_OPESP
-	-- 	NULL -- FECHA_FIN_OPESP
-	-- 	FROM EXT.CARTERA
-	--     WHERE COD_MEDIADOR = :v_codMediadorCedente
-	--     AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	--     AND RAMO = cRamo
-	--     AND ACTIVO = 1
-	--     AND (
-	--     	-- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	--     	EXISTS (SELECT 1 FROM #TEMPCODAVAL) 
-	--     			AND NUM_AVAL_HOST IN (SELECT COD_AVAL FROM #TEMPCODAVAL)
-	--     	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	--     	OR NOT EXISTS (SELECT 1 FROM #TEMPCODAVAL)
-	--     )
-	--     ORDER BY NUM_POLIZA,NUM_ANUALIDAD;
-		
-	-- 	--ACTUALIZAMOS AVAL MEDIADOR RECEPTOR
-	--     UPDATE EXT.CARTERA
-	--     SET ACTIVO = 0,
-	--     MODIF_USER = 'SMM',
-	--     MODIF_SOURCE = v_modifSource,
-	--     MODIF_DATE = CURRENT_TIMESTAMP
-	--     WHERE COD_MEDIADOR = :v_codMediadorCedente
-	--     AND COD_SUBCLAVE = :v_subClaveMediadorCedente
-	--     AND RAMO = cRamo
-	--     AND ACTIVO = 1
-	--     AND (
-	--     	-- SI EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN ESAS PÓLIZAS
-	--     	EXISTS (SELECT 1 FROM #TEMPCODAVAL) 
-	--     			AND NUM_AVAL_HOST IN (SELECT COD_AVAL FROM #TEMPCODAVAL)
-	--     	-- SI NO EXISTEN VALORES EN NUM_POLIZAS SE TRASPASAN TODAS LAS PÓLIZAS
-	--     	OR NOT EXISTS (SELECT 1 FROM #TEMPCODAVAL)
-	--     );
-	-- END IF;
-    
- --   --BORRAMOS TABLA TEMPORAL
- --   DROP TABLE #TEMPNUMPOLIZAS;
- --   DROP TABLE #TEMPCODAVAL;
 END;
 
+DO BEGIN
 
-DO BEGIN 
+DELETE FROM EXT.CARTERA WHERE NUM_POLIZA = 1006785;
+INSERT INTO EXT.CARTERA
+SELECT * FROM EXT.CARTERA_SMM WHERE NUM_POLIZA = 1006785;
 
-DECLARE JSON VARCHAR(5000) = '{ "codigoMediadorCedente":"0004", "subClaveMediadorCedente":"0000", "polizas":[{"num_poliza":"22751","porcentaje_intermediacion":"100.000"},{"num_poliza":"9008150","porcentaje_intermediacion":"100.000"},{"num_poliza":"9052663","porcentaje_intermediacion":"100.000"},{"num_poliza":"9053785","porcentaje_intermediacion":"100.000"}],"fechaTraspaso":"2025-02-12","caseId":"1779" }';
-DECLARE vRAMO VARCHAR(50) = 'CAUCION';
-TRUNCATE TABLE EXT.CARTERA;
-INSERT INTO EXT.CARTERA SELECT * FROM EXT.CARTERA_BKP_04022025 ;
--- UPDATE EXT.CARTERA SET NUM_FIANZA = 0 WHERE IDPRODUCT = '';
+SELECT RAMO,IDPRODUCT,NUM_POLIZA,NUM_FIANZA,NUM_EXPEDIENTE,NUM_AVAL_HOST,COD_MEDIADOR,COD_SUBCLAVE,MODIF_USER,MODIF_SOURCE,ACTIVO FROM EXT.CARTERA WHERE NUM_POLIZA = 1006785;
+ CALL EXT.sp_traspaso_mediador_mediador_con_derechos_caucion_test(2384,'TEST');
 
-DELETE FROM EXT.CSE_DEBUG WHERE PROCESO LIKE '%sp_traspaso_mediador_mediador_con_derechos_caucion%';
+SELECT ACTIVO,RAMO,IDPRODUCT,NUM_POLIZA,NUM_FIANZA,NUM_EXPEDIENTE,NUM_AVAL_HOST,COD_MEDIADOR,COD_SUBCLAVE,MODIF_USER,MODIF_SOURCE FROM EXT.CARTERA WHERE NUM_POLIZA = 1006785 ORDER BY COD_MEDIADOR,NUM_FIANZA;
 
-SELECT ACTIVO,IDPAIS,IDPRODUCT,NUM_POLIZA,NUM_AVAL_HOST,COD_MEDIADOR,COD_SUBCLAVE,FECHA_INICIO,FECHA_FIN FROM EXT.CARTERA WHERE COD_MEDIADOR = '0004' AND RAMO = vRAMO ORDER BY ACTIVO,COD_MEDIADOR,NUM_POLIZA,NUM_AVAL_HOST;
-
-	
-CALL EXT.sp_traspaso_mediador_mediador_con_derechos_caucion('{ "codigoMediadorCedente":"0004", "subClaveMediadorCedente":"0000", "tipoTraspaso":"parcial", "tipoTraspasoCaucion":"aval_individual", "polizas":[{"num_poliza":"1000257","num_aval":"203002","porcentaje_intermediacion":"100"}], "receptor":[{"codigoMediadorReceptor":"3071","subClaveMediadorReceptor":"0000","porcentajeTraspaso":"100","polizasReceptor":[{"num_poliza":"1000257","num_aval":"203002","porcentaje_intermediacion":"50"}]},{"codigoMediadorReceptor":"2517","subClaveMediadorReceptor":"0000","porcentajeTraspaso":"100","polizasReceptor":[{"num_poliza":"1000257","num_aval":"203002","porcentaje_intermediacion":"50"}]}], "fechaTraspaso":"2025-02-13", "caseId":"1790" }');
-
-SELECT ACTIVO,IDPAIS,IDPRODUCT,NUM_POLIZA,NUM_AVAL_HOST,COD_MEDIADOR,COD_SUBCLAVE,P_INTERMEDIACION,FECHA_INICIO,FECHA_FIN,MODIF_SOURCE,MODIF_DATE,MODIF_USER 
-FROM EXT.CARTERA 
-WHERE (COD_MEDIADOR IN('0004') OR MODIF_USER = 'SMM') AND RAMO = vRAMO ORDER BY ACTIVO,COD_MEDIADOR,NUM_AVAL_HOST,NUM_POLIZA;
-
-
-SELECT * FROM EXT.CSE_DEBUG WHERE PROCESO LIKE '%sp_traspaso_mediador_mediador_con_derechos_caucion%';
-SELECT * FROM EXT.TRASPASOS_TEMP WHERE IDCASE = 1790;
 END;
